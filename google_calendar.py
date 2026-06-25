@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from google.auth.transport.requests import Request
@@ -15,13 +16,18 @@ CREDENTIALS_FILE = BASE_DIR / "credentials.json"
 TOKEN_FILE = BASE_DIR / "token.json"
 
 def get_calendar_service():
-    creds = None
+    # FORCE WRITE BULLETPROOF CHECK: Recreate files on every execution loop if variables exist
+    if os.getenv("GOOGLE_CREDENTIALS_JSON"):
+        with open(CREDENTIALS_FILE, "w") as f:
+            f.write(os.getenv("GOOGLE_CREDENTIALS_JSON"))
+            
+    if os.getenv("GOOGLE_TOKEN_JSON"):
+        with open(TOKEN_FILE, "w") as f:
+            f.write(os.getenv("GOOGLE_TOKEN_JSON"))
 
+    creds = None
     try:
-        creds = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE),
-            SCOPES,
-        )
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
     except FileNotFoundError:
         pass
 
