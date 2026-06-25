@@ -1,0 +1,15 @@
+# Local environment configurations
+.env
+credentials.json
+token.json
+
+# Python Virtual Environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+
+# IDE Settings
+.vscode/
+.idea/
