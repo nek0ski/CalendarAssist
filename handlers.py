@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 from datetime import datetime, timedelta
 import io
@@ -13,46 +14,37 @@ from gemini import extract_event, extract_event_from_image
 from google_calendar import create_calendar_event
 from models import CalendarEvent
 
+# A simple dynamic file-based backup state to prevent session loss on free servers
+STATE_DIR = "/tmp/bot_sessions"
+os.makedirs(STATE_DIR, exist_ok=True)
+
+def save_session(chat_id, data):
+    with open(f"{STATE_DIR}/{chat_id}.json", "w") as f:
+        json.dump(data, f)
+
+def load_session(chat_id):
+    path = f"{STATE_DIR}/{chat_id}.json"
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
 
 async def extract_message_content_and_type(message):
-    """Extracts text, caption, or downloads an image file from the message."""
-    # If it's a plain text message
     if message.text:
         return message.text, "text"
-
-    # If it's a photo/poster
     if message.photo:
-        # Get the highest resolution version of the photo
         photo_file = await message.photo[-1].get_file()
-        # Download the photo into memory as bytes
         photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Return the raw bytes, along with any caption attached to the photo
         return {"bytes": bytes(photo_bytes), "caption": message.caption or ""}, "image"
-
     return None, None
-
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    await context.bot.send_message(
-        chat_id=job.chat_id,
-        text=f"⏰ **Upcoming Event Reminder!**\n\n{job.data}",
-        parse_mode="Markdown"
-    )
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hello! 👋\n\n"
-        "I'm Calendar Assist.\n"
-        "Send me an event text, or upload/forward an event flyer/poster, and I'll add it to your calendar!"
+        "Hello! 👋\n\nI'm Calendar Assist.\nSend me an event text or flyer poster, and I'll add it to your calendar completely free!"
     )
-
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content, content_type = await extract_message_content_and_type(update.message)
-
     if not content_type:
         await update.message.reply_text("I couldn't find any readable text or images.")
         return
@@ -64,157 +56,102 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔍 Analyzing flyer layout with Gemini Vision...")
             event = extract_event_from_image(content["bytes"], content["caption"])
 
-        # Confidence check
-        if (
-            event.confidence >= 0.80
-            and event.title
-            and event.date
-            and event.start_time
-        ):
-            context.user_data["pending_event"] = event.model_dump()
+        if event.confidence >= 0.80 and event.title and event.date and event.start_time:
+            # Persistent cross-request state tracking
+            save_session(update.message.chat_id, event.model_dump())
 
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ Add to Calendar", callback_data="add_calendar"),
+                    # Changed to align callback data paths
+                    InlineKeyboardButton("✅ Add to Calendar", callback_data="confirm_event"),
                     InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             await update.message.reply_text(
-                f"""📅 Event Found via OCR\n\n📌 Title:\n{event.title}\n\n📆 Date:\n{event.date}\n\n🕒 Start:\n{event.start_time}\n\n🕓 End:\n{event.end_time or "Not specified"}\n\n📍 Location:\n{event.location or "Not specified"}\n\n🎯 Confidence:\n{event.confidence:.0%}\n\nAdd this to your calendar?""",
+                f"📅 Event Found via OCR\n\n📌 Title:\n{event.title}\n\n%s Date:\n{event.date}\n\n🕒 Start:\n{event.start_time}\n\n🕓 End:\n{event.end_time or 'Not specified'}\n\n📍 Location:\n{event.location or 'Not specified'}\n\n🎯 Confidence:\n{event.confidence:.0%}\n\nAdd this to your calendar?" % "📆",
                 reply_markup=reply_markup,
             )
         else:
             await update.message.reply_text(
-                f"⚠️ I couldn't confidently extract the details from this flyer.\n\nTitle: {event.title}\nDate: {event.date}\nStart Time: {event.start_time}\n\nConfidence: {event.confidence:.0%}\n\nPlease provide a clearer text copy or image."
+                f"⚠️ I couldn't confidently extract details.\n\nTitle: {event.title}\nDate: {event.date}\nConfidence: {event.confidence:.0%}"
             )
-
     except Exception as e:
         print(f"Error in echo handler: {e}")
-        await update.message.reply_text("❌ Something went wrong while extracting the event details.")
-
-
-async def add_calendar_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    event_data = context.user_data.get("pending_event")
-
-    if not event_data:
-        await query.edit_message_text("❌ Session expired or event info missing. Please send the message again.")
-        return
-
-    try:
-        event = CalendarEvent(**event_data)
-        await query.edit_message_text("⏳ Connecting to Google Calendar...")
-        
-        calendar_link = create_calendar_event(event)
-        
-        # Schedule notification (Will operate natively seamlessly on Railway)
-        try:
-            event_datetime = datetime.fromisoformat(f"{event.date}T{event.start_time}")
-            reminder_time = event_datetime - timedelta(hours=1)
-            now = datetime.now()
-
-            if reminder_time <= now:
-                reminder_time = now + timedelta(seconds=10)
-                reminder_msg = f"📌 **{event.title}** is starting very soon at {event.start_time}!"
-            else:
-                reminder_msg = f"📌 **{event.title}** starts in 1 hour (at {event.start_time})!"
-
-            context.job_queue.run_once(
-                send_reminder,
-                when=reminder_time,
-                chat_id=query.message.chat_id,
-                name=f"reminder_{event.title}_{event.date}",
-                data=reminder_msg
-            )
-        except Exception as schedule_err:
-            print(f"Notification scheduling failed: {schedule_err}")
-
-        context.user_data.pop("pending_event", None)
-
-        await query.edit_message_text(
-            f"📅 **Event Added Successfully!**\n\nReminders are active! I'll ping you here on Telegram 1 hour before it kicks off.\n\n🔗 [View in Google Calendar]({calendar_link})",
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-
-    except Exception as e:
-        print(f"Error in calendar callback: {e}")
-        await query.edit_message_text("❌ Authorization failed or something went wrong creating the event.")
-
-
-async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data.pop("pending_event", None)
-    await query.edit_message_text("❌ Event cancelled.")
-
+        await update.message.reply_text("❌ Something went wrong while extracting details.")
 
 async def handle_callback(update, context):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "confirm_event":
-        # 1. Retrieve the cached event from user_data
-        event_data = context.user_data.get('pending_event') if context else None
-        # Note: In our new app.py, we will pass context or handle session data cleanly.
-        
-        # ... [Your existing code that calls create_calendar_event(event_data)] ...
-        
-        # 2. Schedule the 1-hour reminder via Cron-Job.org API
-        CRON_API_KEY = os.getenv("CRON_JOB_API_KEY")
-        
-        if CRON_API_KEY and event_data:
-            # Parse event date and start time
-            event_datetime_str = f"{event_data.date} {event_data.start_time}"
-            event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M")
-            
-            # Calculate reminder execution time (1 hour before event)
-            reminder_time = event_datetime - timedelta(hours=1)
-            
-            # Cron-Job.org expects date components for specific execution execution schedules
-            # Format target: minute, hour, day, month, day of week
-            cron_schedule = {
-                "minutes": [reminder_time.minute],
-                "hours": [reminder_time.hour],
-                "mdays": [reminder_time.day],
-                "months": [reminder_time.month],
-                "wdays": [-1] # -1 means every day of the week (not restricted)
-            }
-            
-            # Construct the payload directing Cron-Job to ping our new app URL
-            cron_payload = {
-                "job": {
-                    "url": f"https://{os.getenv('PYTHONANYWHERE_USERNAME')}.pythonanywhere.com/reminder-trigger",
-                    "enabled": True,
-                    "title": f"Reminder_{event_data.title.replace(' ', '_')}",
-                    "schedule": cron_schedule,
-                    "requestMethod": 1, # 1 corresponds to a POST request
-                    "requestBody": json.dumps({
-                        "chat_id": query.message.chat_id,
-                        "title": event_data.title
-                    })
-                }
-            }
-            
-            # Send the scheduling command out to the external cron engine
-            headers = {
-                "Authorization": f"Bearer {CRON_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            
-            response = requests.post(
-                "https://api.cron-job.org/jobs", 
-                json=cron_payload, 
-                headers=headers
-            )
-            
-            if response.status_code == 200:
-                print("External reminder scheduled successfully via Cron-Job.org")
-            else:
-                print(f"Failed to schedule external cron task: {response.text}")
+    chat_id = query.message.chat_id
+    
+    if query.data == "cancel":
+        await query.edit_message_text("❌ Event cancelled.")
+        return
 
-        await query.edit_message_text(text="✅ Event successfully synced to Google Calendar and 1-hour reminder scheduled!")
+    if query.data == "confirm_event":
+        event_data = load_session(chat_id)
+        if not event_data:
+            await query.edit_message_text("❌ Session expired. Please upload your flyer again.")
+            return
+
+        try:
+            event = CalendarEvent(**event_data)
+            await query.edit_message_text("⏳ Syncing with Google Calendar...")
+            
+            # Generate your remote calendar URL interface
+            calendar_link = create_calendar_event(event)
+            
+            # Fire automation registration to Cron-Job.org
+            CRON_API_KEY = os.getenv("CRON_JOB_API_KEY")
+            username = os.getenv("PYTHONANYWHERE_USERNAME")
+            
+            if CRON_API_KEY and username:
+                try:
+                    event_datetime_str = f"{event.date} {event.start_time}"
+                    event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M")
+                    reminder_time = event_datetime - timedelta(hours=1)
+                    
+                    cron_schedule = {
+                        "minutes": [reminder_time.minute],
+                        "hours": [reminder_time.hour],
+                        "mdays": [reminder_time.day],
+                        "months": [reminder_time.month],
+                        "wdays": [-1]
+                    }
+                    
+                    cron_payload = {
+                        "job": {
+                            "url": f"https://{username}.pythonanywhere.com/reminder-trigger",
+                            "enabled": True,
+                            "title": f"Reminder_{chat_id}_{int(reminder_time.timestamp())}",
+                            "schedule": cron_schedule,
+                            "requestMethod": 1,
+                            "requestBody": json.dumps({
+                                "chat_id": chat_id,
+                                "title": event.title
+                            })
+                        }
+                    }
+                    
+                    requests.post(
+                        "https://api.cron-job.org/jobs", 
+                        json=cron_payload, 
+                        headers={
+                            "Authorization": f"Bearer {CRON_API_KEY}",
+                            "Content-Type": "application/json"
+                        }
+                    )
+                except Exception as cron_err:
+                    print(f"Cron-job hook failed: {cron_err}")
+
+            await query.edit_message_text(
+                f"📅 **Event Added Successfully!**\n\nYour 1-hour automated push notification is scheduled via the external task engine.\n\n🔗 [View in Google Calendar]({calendar_link})",
+                parse_mode="Markdown",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            print(f"Error executing callback sequence: {e}")
+            await query.edit_message_text("❌ System synchronization error occurred.")
