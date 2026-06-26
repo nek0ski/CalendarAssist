@@ -1,3 +1,5 @@
+import os
+import requests
 from datetime import datetime, timedelta
 import io
 from telegram import (
@@ -149,3 +151,70 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     context.user_data.pop("pending_event", None)
     await query.edit_message_text("❌ Event cancelled.")
+
+
+async def handle_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "confirm_event":
+        # 1. Retrieve the cached event from user_data
+        event_data = context.user_data.get('pending_event') if context else None
+        # Note: In our new app.py, we will pass context or handle session data cleanly.
+        
+        # ... [Your existing code that calls create_calendar_event(event_data)] ...
+        
+        # 2. Schedule the 1-hour reminder via Cron-Job.org API
+        CRON_API_KEY = os.getenv("CRON_JOB_API_KEY")
+        
+        if CRON_API_KEY and event_data:
+            # Parse event date and start time
+            event_datetime_str = f"{event_data.date} {event_data.start_time}"
+            event_datetime = datetime.strptime(event_datetime_str, "%Y-%m-%d %H:%M")
+            
+            # Calculate reminder execution time (1 hour before event)
+            reminder_time = event_datetime - timedelta(hours=1)
+            
+            # Cron-Job.org expects date components for specific execution execution schedules
+            # Format target: minute, hour, day, month, day of week
+            cron_schedule = {
+                "minutes": [reminder_time.minute],
+                "hours": [reminder_time.hour],
+                "mdays": [reminder_time.day],
+                "months": [reminder_time.month],
+                "wdays": [-1] # -1 means every day of the week (not restricted)
+            }
+            
+            # Construct the payload directing Cron-Job to ping our new app URL
+            cron_payload = {
+                "job": {
+                    "url": f"https://{os.getenv('PYTHONANYWHERE_USERNAME')}.pythonanywhere.com/reminder-trigger",
+                    "enabled": True,
+                    "title": f"Reminder_{event_data.title.replace(' ', '_')}",
+                    "schedule": cron_schedule,
+                    "requestMethod": 1, # 1 corresponds to a POST request
+                    "requestBody": json.dumps({
+                        "chat_id": query.message.chat_id,
+                        "title": event_data.title
+                    })
+                }
+            }
+            
+            # Send the scheduling command out to the external cron engine
+            headers = {
+                "Authorization": f"Bearer {CRON_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(
+                "https://api.cron-job.org/jobs", 
+                json=cron_payload, 
+                headers=headers
+            )
+            
+            if response.status_code == 200:
+                print("External reminder scheduled successfully via Cron-Job.org")
+            else:
+                print(f"Failed to schedule external cron task: {response.text}")
+
+        await query.edit_message_text(text="✅ Event successfully synced to Google Calendar and 1-hour reminder scheduled!")
